@@ -793,6 +793,72 @@ function resolveOrsaActivity(input: string | undefined): { code: string; label: 
   );
 }
 
+interface BeaApiError {
+  APIErrorCode?: string;
+  APIErrorDescription?: string;
+  ErrorDetail?: unknown;
+}
+
+/** A BEA error payload (HTTP 200 with BEAAPI.Error or BEAAPI.Results.Error). */
+class BeaError extends Error {
+  readonly code: string;
+  readonly description: string;
+  readonly detail: unknown;
+  constructor(e: BeaApiError) {
+    super(`BEA: ${e.APIErrorDescription ?? 'API error'}`);
+    this.code = String(e.APIErrorCode ?? '');
+    this.description = e.APIErrorDescription ?? '';
+    this.detail = e.ErrorDetail;
+  }
+}
+
+/**
+ * What a caller-side BEA miss should RETURN, or undefined when the error is not
+ * one (the caller rethrows it, keeping class `error`). Fleet #2496.
+ *
+ * BEA answers every miss with HTTP 200 and an error object, in one of two
+ * places: BEAAPI.Error or BEAAPI.Results.Error. Only the first was checked, so
+ * an unknown dataset came back as a SUCCESS carrying BEA's error JSON. The rest
+ * threw a bare `BEA: …`, which booked as a Pipeworx defect. Wording and codes
+ * verbatim from the live API, 2026-09-28:
+ *   20  "The Dataset requested does not exist."           → not_found
+ *   40  "…requires parameters that were missing…"          → user_error
+ *       "Error retrieving NIPA data." (unknown table, or a
+ *        year with no rows — BEA does not say which)       → empty, no_match
+ * Anything else (code 101 "Unknown error.", auth) keeps the thrown path.
+ */
+function beaMissResult(err: unknown, dataset: string, method: string): Record<string, unknown> | undefined {
+  if (!(err instanceof BeaError)) return undefined;
+  if (err.code === '20' || /Dataset requested does not exist/i.test(err.description)) {
+    return {
+      error: 'not_found',
+      message: `BEA has no dataset "${dataset}". Call dataset_list to find the name (e.g. "NIPA", "Regional", "GDPbyIndustry").`,
+      dataset,
+    };
+  }
+  if (err.code === '40' || /missing from the request|not valid|invalid/i.test(err.description)) {
+    const missing = JSON.stringify(err.detail ?? '').match(/"ParameterName":"([^"]+)"/)?.[1];
+    return {
+      error: 'user_error',
+      message:
+        `BEA rejected the ${dataset} request: ${err.description}${missing ? ` (missing: ${missing})` : ''} ` +
+        `Call parameter_list({dataset: "${dataset}"}) for the required parameters and parameter_values for their valid values.`,
+    };
+  }
+  if (method === 'GETDATA' && /^Error retrieving .* data\.?$/i.test(err.description.trim())) {
+    return {
+      dataset,
+      Data: [],
+      empty_reason: 'no_match',
+      note:
+        `BEA returned no rows for this ${dataset} request ("${err.description}"). BEA gives the same answer for a table name ` +
+        `it does not have and for a year it has not published, so check TableName with parameter_values({dataset: "${dataset}", parameter: "TableName"}) ` +
+        `and Year against the table's published range.`,
+    };
+  }
+  return undefined;
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   const apiKey = (args._apiKey as string | undefined)?.trim();
   if (!apiKey) throw new Error('BEA requires an API key (its UserID): pass your key as the _apiKey argument (free at https://apps.bea.gov/api/signup/).');
@@ -802,10 +868,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     const res = await pwFetch(`${BASE}?${p}`, { headers: { Accept: 'application/json', 'User-Agent': UA } });
     if (!res.ok) throw await httpError(res, 'BEA');
     const j = (await res.json()) as {
-      BEAAPI?: { Error?: { APIErrorDescription?: string }; Request?: unknown; Results?: unknown };
+      BEAAPI?: { Error?: BeaApiError; Request?: unknown; Results?: { Error?: BeaApiError } };
     };
-    const err = j?.BEAAPI?.Error;
-    if (err) throw new Error(`BEA: ${err.APIErrorDescription ?? 'API error'}`);
+    const err = j?.BEAAPI?.Error ?? j?.BEAAPI?.Results?.Error;
+    if (err) throw new BeaError(err);
     // SECURITY: BEA echoes the request back under BEAAPI.Request, and that echo
     // includes UserID — i.e. OUR PLATFORM KEY. Returning the raw response handed
     // the key to every caller of every tool in this pack. Drop the echo: it is
@@ -818,103 +884,138 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     if (typeof v !== 'string' || !v.trim()) throw new Error(`Required argument "${k}" is missing. Pass a string like ${ex}.`);
     return v;
   };
-  switch (name) {
-    case 'dataset_list':
-      return get({ method: 'GETDATASETLIST' });
-    case 'parameter_list':
-      return get({ method: 'GETPARAMETERLIST', DataSetName: reqStr('dataset', '"NIPA"') });
-    case 'parameter_values':
-      return get({ method: 'GETPARAMETERVALUES', DataSetName: reqStr('dataset', '"NIPA"'), ParameterName: reqStr('parameter', '"TableName"') });
-    case 'parameter_values_filtered': {
-      const rest: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(args)) {
-        if (k === '_apiKey' || k === 'dataset' || k === 'target_parameter') continue;
-        if (v != null) rest[k] = v;
-      }
-      return get({ method: 'GetParameterValuesFiltered', DataSetName: reqStr('dataset', '"NIPA"'), TargetParameter: reqStr('target_parameter', '"TableName"'), ...rest });
-    }
-    case 'outdoor_recreation_economy': {
-      const act = resolveOrsaActivity(args.activity as string | undefined);
-      const year = Number.isFinite(Number(args.year)) && Number(args.year) > 1990 ? String(Math.floor(Number(args.year))) : '2023';
-      const raw = (await get({
-        method: 'GETDATA',
-        DataSetName: 'Regional',
-        TableName: 'SAOACTVA',
-        LineCode: act.code,
-        GeoFips: 'STATE',
-        Year: year,
-      })) as { BEAAPI?: { Results?: { Data?: Record<string, unknown>[]; Statistic?: string; UnitOfMeasure?: string } } };
-
-      const rows = raw?.BEAAPI?.Results?.Data ?? [];
-      if (rows.length === 0) {
+  const dataset = typeof args.dataset === 'string' ? args.dataset : '';
+  try {
+    return await dispatch();
+  } catch (err) {
+    if (name === 'outdoor_recreation_economy') {
+      // BEA answers a year the account has not published with code 101
+      // "Unknown error." under Results.Error — which used to slip past as an
+      // empty table and hit the lag message below. Keep that message.
+      if (err instanceof BeaError) {
         throw new Error(
-          `BEA returned no outdoor-recreation data for activity "${act.label}" in ${year}. The account is published with a lag — try an earlier year (2023 is usually the latest complete one).`,
+          `BEA returned no outdoor-recreation data for that year (${err.description}). The account is published with a lag — try an earlier year (2023 is usually the latest complete one).`,
         );
       }
-
-      // Filter to one state if asked. Accepts "CO" or "Colorado".
-      const want = (args.state as string | undefined)?.trim();
-      const wantName = want
-        ? (US_STATE_ABBR[want.toUpperCase()] ?? want).toLowerCase()
-        : null;
-
-      let out = rows.map((r) => {
-        // DataValue arrives as a comma-formatted string in thousands of dollars.
-        const thousands = Number(String(r.DataValue ?? '').replace(/,/g, ''));
-        return {
-          state: String(r.GeoName ?? ''),
-          value_added_usd: Number.isFinite(thousands) ? thousands * 1000 : null,
-          value_added_thousands: Number.isFinite(thousands) ? thousands : null,
-          year: String(r.TimePeriod ?? year),
-        };
-      });
-      // Compute the national figure across ALL states BEFORE any filtering or
-      // limiting. Summing only the returned rows made a `limit: 3` call report
-      // $205B as the national outdoor-recreation total when it is $670B — the
-      // kind of confidently-wrong number that gets published.
-      const nationalTotal = out.reduce((sum, r) => sum + (r.value_added_usd ?? 0), 0);
-      const nationalStates = out.length;
-
-      if (wantName) {
-        out = out.filter((r) => r.state.toLowerCase() === wantName);
-        if (out.length === 0) {
-          throw new Error(`No BEA data for state "${want}". Pass a US state name or 2-letter abbreviation, or omit to get all states.`);
+      throw err;
+    }
+    const miss = beaMissResult(err, dataset, name === 'get_data' ? 'GETDATA' : 'META');
+    if (miss) return miss;
+    throw err;
+  }
+  async function dispatch(): Promise<unknown> {
+    switch (name) {
+      case 'dataset_list':
+        return get({ method: 'GETDATASETLIST' });
+      case 'parameter_list':
+        return get({ method: 'GETPARAMETERLIST', DataSetName: reqStr('dataset', '"NIPA"') });
+      case 'parameter_values':
+        return get({ method: 'GETPARAMETERVALUES', DataSetName: reqStr('dataset', '"NIPA"'), ParameterName: reqStr('parameter', '"TableName"') });
+      case 'parameter_values_filtered': {
+        const rest: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(args)) {
+          if (k === '_apiKey' || k === 'dataset' || k === 'target_parameter') continue;
+          if (v != null) rest[k] = v;
         }
-      } else {
-        out.sort((a, b) => (b.value_added_usd ?? 0) - (a.value_added_usd ?? 0));
-        const lim = Math.min(51, Math.max(1, Math.floor(Number(args.limit) || 51)));
-        out = out.slice(0, lim);
+        return get({ method: 'GetParameterValuesFiltered', DataSetName: reqStr('dataset', '"NIPA"'), TargetParameter: reqStr('target_parameter', '"TableName"'), ...rest });
       }
+      case 'outdoor_recreation_economy': {
+        const act = resolveOrsaActivity(args.activity as string | undefined);
+        const year = Number.isFinite(Number(args.year)) && Number(args.year) > 1990 ? String(Math.floor(Number(args.year))) : '2023';
+        const raw = (await get({
+          method: 'GETDATA',
+          DataSetName: 'Regional',
+          TableName: 'SAOACTVA',
+          LineCode: act.code,
+          GeoFips: 'STATE',
+          Year: year,
+        })) as { BEAAPI?: { Results?: { Data?: Record<string, unknown>[]; Statistic?: string; UnitOfMeasure?: string } } };
 
-      const returnedSubtotal = out.reduce((sum, r) => sum + (r.value_added_usd ?? 0), 0);
-      return {
-        activity: act.label,
-        activity_line_code: act.code,
-        measure: 'value_added',
-        year,
-        source: 'BEA Outdoor Recreation Satellite Account, table SAOACTVA',
-        unit: 'US dollars',
-        states_returned: out.length,
-        // National = all 50 states + DC, regardless of `state`/`limit` filters.
-        national_total_value_added_usd: nationalTotal,
-        national_states_counted: nationalStates,
-        returned_subtotal_usd: returnedSubtotal,
-        note:
-          'Value added = the activity\'s contribution to GDP, i.e. its market size in the national accounts. Official BEA statistics. Birdwatching / wildlife watching is not a separate line in this account; hunting and fishing are the only wildlife-related activities measured.' +
-          ' national_total_value_added_usd covers all 50 states + DC and is NOT affected by the state or limit filters; returned_subtotal_usd is the sum of just the rows returned here.',
-        states: out,
-      };
-    }
-    case 'get_data': {
-      const rest: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(args)) {
-        if (k === '_apiKey' || k === 'dataset') continue;
-        if (v != null) rest[k] = v;
+        const rows = raw?.BEAAPI?.Results?.Data ?? [];
+        if (rows.length === 0) {
+          throw new Error(
+            `BEA returned no outdoor-recreation data for activity "${act.label}" in ${year}. The account is published with a lag — try an earlier year (2023 is usually the latest complete one).`,
+          );
+        }
+
+        // Filter to one state if asked. Accepts "CO" or "Colorado".
+        const want = (args.state as string | undefined)?.trim();
+        const wantName = want
+          ? (US_STATE_ABBR[want.toUpperCase()] ?? want).toLowerCase()
+          : null;
+
+        let out = rows.map((r) => {
+          // DataValue arrives as a comma-formatted string in thousands of dollars.
+          const thousands = Number(String(r.DataValue ?? '').replace(/,/g, ''));
+          return {
+            state: String(r.GeoName ?? ''),
+            value_added_usd: Number.isFinite(thousands) ? thousands * 1000 : null,
+            value_added_thousands: Number.isFinite(thousands) ? thousands : null,
+            year: String(r.TimePeriod ?? year),
+          };
+        });
+        // Compute the national figure across ALL states BEFORE any filtering or
+        // limiting. Summing only the returned rows made a `limit: 3` call report
+        // $205B as the national outdoor-recreation total when it is $670B — the
+        // kind of confidently-wrong number that gets published.
+        const nationalTotal = out.reduce((sum, r) => sum + (r.value_added_usd ?? 0), 0);
+        const nationalStates = out.length;
+
+        if (wantName) {
+          out = out.filter((r) => r.state.toLowerCase() === wantName);
+          if (out.length === 0) {
+            throw new Error(`No BEA data for state "${want}". Pass a US state name or 2-letter abbreviation, or omit to get all states.`);
+          }
+        } else {
+          out.sort((a, b) => (b.value_added_usd ?? 0) - (a.value_added_usd ?? 0));
+          const lim = Math.min(51, Math.max(1, Math.floor(Number(args.limit) || 51)));
+          out = out.slice(0, lim);
+        }
+
+        const returnedSubtotal = out.reduce((sum, r) => sum + (r.value_added_usd ?? 0), 0);
+        return {
+          activity: act.label,
+          activity_line_code: act.code,
+          measure: 'value_added',
+          year,
+          source: 'BEA Outdoor Recreation Satellite Account, table SAOACTVA',
+          unit: 'US dollars',
+          states_returned: out.length,
+          // National = all 50 states + DC, regardless of `state`/`limit` filters.
+          national_total_value_added_usd: nationalTotal,
+          national_states_counted: nationalStates,
+          returned_subtotal_usd: returnedSubtotal,
+          note:
+            'Value added = the activity\'s contribution to GDP, i.e. its market size in the national accounts. Official BEA statistics. Birdwatching / wildlife watching is not a separate line in this account; hunting and fishing are the only wildlife-related activities measured.' +
+            ' national_total_value_added_usd covers all 50 states + DC and is NOT affected by the state or limit filters; returned_subtotal_usd is the sum of just the rows returned here.',
+          states: out,
+        };
       }
-      return get({ method: 'GETDATA', DataSetName: reqStr('dataset', '"NIPA"'), ...rest });
+      case 'get_data': {
+        const rest: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(args)) {
+          if (k === '_apiKey' || k === 'dataset') continue;
+          if (v != null) rest[k] = v;
+        }
+        const out = (await get({ method: 'GETDATA', DataSetName: reqStr('dataset', '"NIPA"'), ...rest })) as {
+          BEAAPI?: { Results?: { Data?: unknown[] } | { Data?: unknown[] }[] };
+        };
+        // A 200 with zero rows and no error object is still an empty answer and
+        // must say so (docs/silent-zero-policy.md).
+        const results = out?.BEAAPI?.Results;
+        const data = Array.isArray(results) ? results.flatMap((r) => r?.Data ?? []) : results?.Data;
+        if (Array.isArray(data) && data.length === 0) {
+          return {
+            ...out,
+            empty_reason: 'no_match',
+            note: `BEA returned no rows for this ${dataset} request. Check parameter values with parameter_values({dataset: "${dataset}", parameter: "..."}).`,
+          };
+        }
+        return out;
+      }
+      default:
+        throw new Error(`Unknown tool: ${name}`);
     }
-    default:
-      throw new Error(`Unknown tool: ${name}`);
   }
 }
 
