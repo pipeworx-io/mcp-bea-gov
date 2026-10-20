@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-bea-gov",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "BEA — Bureau of Economic Analysis MCP.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-eecea00d43e6e4737313ea09353be344e0bc9bdb6c293a465ba08ce5b70e5520",
-    "sourceCommit": "a00767651388cfd017fdeac82188622721db2051"
+    "sourceHash": "v1-1c3cc842c29ac7d40a7c42a251daa733c7a2a342b27120a84e609b6838b1b10c",
+    "sourceCommit": "5d8d3a58a457b8464c117515d81b8b6ecb53fdfb"
   }
 }
