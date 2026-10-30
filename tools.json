@@ -87,7 +87,7 @@
   },
   {
     "name": "get_data",
-    "description": "Fetch actual BEA economic data from the specified dataset (e.g. NIPA) using dataset-specific parameters; returns time series values such as GDP, PCE, regional income, and GDP by industry — including the agriculture share of GDP / farm-sector value added as a percent of the economy (GDPbyIndustry dataset).",
+    "description": "Fetch actual BEA economic data from the specified dataset (e.g. NIPA) using dataset-specific parameters; returns time series values such as GDP, PCE, regional income, and GDP by industry — US ONLY, and only when you already know the dataset-specific parameters (call parameter_list first). GDPbyIndustry additionally requires Industry and Frequency codes this tool cannot guess from a plain-English question. For \"what share of GDP comes from <sector>\" or \"<country>'s agriculture share of GDP\" trended over time, prefer worldbank's get_indicator (NV.AGR.TOTL.ZS for agriculture) — it needs only a country code and works for any country, not just the US.",
     "inputSchema": {
       "type": "object",
       "properties": {

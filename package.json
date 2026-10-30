@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-bea-gov",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "BEA — Bureau of Economic Analysis MCP.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "bea-gov",
     "gatewaySlug": "bea-gov",
-    "sourceHash": "v1-46ea8602af7ae674ef22c40ffc5542c9d3728fd88bb7f38e536596c9f4f080a0",
-    "sourceCommit": "4277282d72f9bf55e548b3799aaf737baf22152f"
+    "sourceHash": "v1-b74648d7842fc8ec3a6282d589070722451e048845ff09976e1103f26c658121",
+    "sourceCommit": "5cb09714e895571153f3d9663c36ff0f140cadd6"
   }
 }
